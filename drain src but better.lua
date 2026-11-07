@@ -957,6 +957,37 @@ Exit	退出
 Working	可用
 Outdated - use at own risk	已过期 - 风险自负
 Loading...	加载中...
+Dealer ESP	经销商透视
+Dealer	经销商
+Dealer color	经销商颜色
+Armory	军火商
+Armory Dealer	军火商
+Armory color	军火商颜色
+Rebel	叛军
+Rebel Dealer	叛军经销商
+Rebel color	叛军颜色
+Show distance	显示距离
+Highlight	高亮
+Draws name, distance and an outline over the plain dealer NPC.	在普通经销商 NPC 上绘制名称、距离和描边。
+Draws name, distance and an outline over the armory dealer NPC.	在军火商 NPC 上绘制名称、距离和描边。
+Draws name, distance and an outline over the rebel dealer NPC.	在叛军经销商 NPC 上绘制名称、距离和描边。
+Appends the distance in meters next to the name.	在名称旁附加以米为单位的距离。
+Outlines the dealer model through walls.	透过墙体描边经销商模型。
+0 draws every dealer on the map.	0 表示绘制地图上所有经销商。
+Crate ESP	箱子透视
+Crate	箱子
+Red Crate	红色箱子
+Green Crate	绿色箱子
+Red crate color	红色箱子颜色
+Green crate color	绿色箱子颜色
+Event / Airdrop	事件 / 空投
+Event color	事件颜色
+airdrop // event	空投 // 事件
+Draws name, distance and an outline over the red crates.	在红色箱子上绘制名称、距离和描边。
+Draws name, distance and an outline over the green crates.	在绿色箱子上绘制名称、距离和描边。
+Draws any other pile in SpawnedPiles as airdrop // event.	将 SpawnedPiles 中的其他堆叠绘制为空投 // 事件。
+Outlines the crate through walls.	透过墙体描边箱子。
+0 draws every crate on the map.	0 表示绘制地图上所有箱子。
 ]==]
         local strings = {}
         for line in string.gmatch(blob, "[^\n]+") do
@@ -29548,6 +29579,913 @@ library2:OnUnload(function()
         molotovEsp.WorkspaceChildConnection = nil
     end
 end)
+
+-- // dealer esp
+do
+local dealerEspSection = viewPage:AddLeftGroupbox('Dealer ESP')
+
+local players = game:GetService('Players')
+
+local dealerEsp = {
+    Enabled = false,
+    ArmoryEnabled = false,
+    RebelEnabled = false,
+    ShowDistance = true,
+    UseHighlight = true,
+    MaxDistance = 0,
+    Color = Color3.fromRGB(90, 255, 120),
+    ArmoryColor = Color3.fromRGB(125, 200, 255),
+    RebelColor = Color3.fromRGB(255, 70, 70),
+    Tracked = {},
+    Ignore = setmetatable({}, { __mode = 'k' }),
+    Queue = {},
+    Cursor = 1,
+    Budget = 220,
+    Walking = false,
+    NeedsDedupe = false,
+    TextAt = 0,
+}
+
+local function dealerEspCompact(text)
+    return (tostring(text or ''):lower():gsub('[%s_%-%.%(%)%[%]]', ''))
+end
+
+-- dealer NPCs are plain map models, never player characters
+-- kind order matters: rebel first, then armory, then the plain dealer,
+-- so a model named RebelDealer or ArmoryDealer never lands in the dealer bucket
+local function dealerEspKind(instance)
+    if typeof(instance) ~= 'Instance' then return nil end
+    if not (instance:IsA('Model') or instance:IsA('BasePart')) then return nil end
+    if instance:IsA('Model') and players:GetPlayerFromCharacter(instance) then return nil end
+
+    local compact = dealerEspCompact(instance.Name)
+    if compact == '' then return nil end
+
+    if compact:find('rebel', 1, true) then
+        -- the rebel vendor only spawns now and then and is named loosely
+        if compact:find('dealer', 1, true)
+            or compact:find('drug', 1, true)
+            or compact:find('vendor', 1, true)
+            or compact:find('sell', 1, true)
+            or compact:find('shop', 1, true) then
+            return 'rebel'
+        end
+        return nil
+    end
+
+    if compact:find('armory', 1, true) or compact:find('armoury', 1, true) then
+        return 'armory'
+    end
+
+    if compact:find('dealer', 1, true) or compact:find('dealerman', 1, true) then
+        return 'dealer'
+    end
+
+    return nil
+end
+
+local function dealerEspWanted(kind)
+    if kind == 'rebel' then return dealerEsp.RebelEnabled end
+    if kind == 'armory' then return dealerEsp.ArmoryEnabled end
+    return dealerEsp.Enabled
+end
+
+local function dealerEspAnchor(model)
+    if model:IsA('BasePart') then return model end
+
+    local head = model:FindFirstChild('Head', true)
+    if head and head:IsA('BasePart') then return head end
+
+    local root = model:FindFirstChild('HumanoidRootPart', true)
+    if root and root:IsA('BasePart') then return root end
+
+    return model:FindFirstChildWhichIsA('BasePart', true)
+end
+
+local function dealerEspColorFor(entry)
+    if entry.kind == 'rebel' then return dealerEsp.RebelColor end
+    if entry.kind == 'armory' then return dealerEsp.ArmoryColor end
+    return dealerEsp.Color
+end
+
+local function dealerEspApplyStyle(entry)
+    local color = dealerEspColorFor(entry)
+
+    if entry.Label then
+        entry.Label.TextColor3 = color
+    end
+
+    if entry.Highlight then
+        entry.Highlight.FillColor = color
+        entry.Highlight.OutlineColor = color
+        entry.Highlight.Enabled = dealerEsp.UseHighlight
+    end
+end
+
+local function dealerEspDrop(model)
+    local entry = dealerEsp.Tracked[model]
+    if not entry then return end
+
+    dealerEsp.Tracked[model] = nil
+
+    if entry.Billboard then
+        pcall(function() entry.Billboard:Destroy() end)
+    end
+    if entry.Highlight then
+        pcall(function() entry.Highlight:Destroy() end)
+    end
+end
+
+local function dealerEspClear()
+    local models = {}
+    for model in pairs(dealerEsp.Tracked) do
+        models[#models + 1] = model
+    end
+    for _, model in ipairs(models) do
+        dealerEspDrop(model)
+    end
+end
+
+local function dealerEspPrune(kind)
+    local models = {}
+    for model, entry in pairs(dealerEsp.Tracked) do
+        if entry.kind == kind then models[#models + 1] = model end
+    end
+    for _, model in ipairs(models) do
+        dealerEspDrop(model)
+    end
+end
+
+local function dealerEspAttach(entry, model)
+    local anchor = dealerEspAnchor(model)
+    if not anchor then return end
+
+    entry.Anchor = anchor
+
+    local billboard = Instance.new('BillboardGui')
+    billboard.Name = 'waneDealerESP'
+    billboard.AlwaysOnTop = true
+    billboard.Size = UDim2.fromOffset(220, 26)
+    billboard.StudsOffset = Vector3.new(0, 2.6, 0)
+    billboard.Adornee = anchor
+    billboard.Parent = anchor
+
+    local label = Instance.new('TextLabel')
+    label.Name = 'Label'
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.fromScale(1, 1)
+    label.Font = library2.Font or Enum.Font.Code
+    label.TextSize = 14
+    label.TextStrokeTransparency = 0
+    label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    label.Text = entry.Name
+    label.Parent = billboard
+
+    entry.Billboard = billboard
+    entry.Label = label
+
+    if model:IsA('Model') then
+        local highlight = Instance.new('Highlight')
+        highlight.Name = 'waneDealerESP'
+        highlight.Adornee = model
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.FillTransparency = 0.82
+        highlight.OutlineTransparency = 0
+        highlight.Parent = model
+        entry.Highlight = highlight
+    end
+
+    dealerEspApplyStyle(entry)
+end
+
+local function dealerEspIsOn()
+    return dealerEsp.Enabled or dealerEsp.ArmoryEnabled or dealerEsp.RebelEnabled
+end
+
+-- cheap gate: no gsub, no table churn until class and name say it might be one
+local function dealerEspNameMatches(instance)
+    local name = instance.Name
+    if #name < 5 then return false end
+    local lower = string.lower(name)
+    return string.find(lower, 'dealer', 1, true) ~= nil
+        or string.find(lower, 'rebel', 1, true) ~= nil
+        or string.find(lower, 'armory', 1, true) ~= nil
+        or string.find(lower, 'armoury', 1, true) ~= nil
+end
+
+local function dealerEspNested(instance)
+    local parent = instance.Parent
+    local depth = 0
+    while parent and parent ~= workspace and depth < 64 do
+        if dealerEsp.Tracked[parent] then return true end
+        parent = parent.Parent
+        depth += 1
+    end
+    return false
+end
+
+local function dealerEspDropNested()
+    for model in pairs(dealerEsp.Tracked) do
+        local parent = model.Parent
+        local depth = 0
+        while parent and parent ~= workspace and depth < 64 do
+            if dealerEsp.Tracked[parent] then
+                dealerEsp.Ignore[model] = true
+                dealerEspDrop(model)
+                break
+            end
+            parent = parent.Parent
+            depth += 1
+        end
+    end
+end
+
+local function dealerEspClassify(instance)
+    if dealerEsp.Ignore[instance] then return end
+
+    local entry = dealerEsp.Tracked[instance]
+    if entry then
+        if not entry.Billboard then
+            if dealerEspNested(instance) then
+                dealerEsp.Ignore[instance] = true
+                dealerEspDrop(instance)
+                return
+            end
+            dealerEspAttach(entry, instance)
+        end
+        return
+    end
+
+    local kind = dealerEspKind(instance)
+    if not kind or not dealerEspWanted(kind) then return end
+
+    if dealerEspNested(instance) then
+        dealerEsp.Ignore[instance] = true
+        return
+    end
+
+    entry = { kind = kind, Name = instance.Name }
+    dealerEsp.Tracked[instance] = entry
+    dealerEspAttach(entry, instance)
+    dealerEsp.NeedsDedupe = true
+end
+
+-- the walk starts here and continues a slice per frame on Heartbeat,
+-- never one synchronous GetDescendants() over the whole map
+local function dealerEspRescan()
+    dealerEsp.Queue = { workspace }
+    dealerEsp.Cursor = 1
+    dealerEsp.Walking = true
+end
+
+local function dealerEspStep()
+    if not dealerEspIsOn() then
+        dealerEsp.Walking = false
+        dealerEsp.Cursor = 1
+        dealerEsp.Queue = {}
+        return
+    end
+
+    local queue = dealerEsp.Queue
+    local first = dealerEsp.Cursor
+    local last = first + dealerEsp.Budget - 1
+    if last > #queue then last = #queue end
+
+    for index = first, last do
+        local instance = queue[index]
+        if instance and (instance.Parent ~= nil or instance == workspace) then
+            if dealerEspNameMatches(instance) then
+                pcall(dealerEspClassify, instance)
+            end
+
+            local ok, children = pcall(instance.GetChildren, instance)
+            if ok and children then
+                for childIndex = 1, #children do
+                    queue[#queue + 1] = children[childIndex]
+                end
+            end
+        end
+    end
+
+    dealerEsp.Cursor = last + 1
+    if dealerEsp.Cursor > #queue then
+        dealerEsp.Cursor = 1
+        dealerEsp.Queue = {}
+        dealerEsp.Walking = false
+        if dealerEsp.NeedsDedupe then
+            dealerEsp.NeedsDedupe = false
+            dealerEspDropNested()
+        end
+    end
+end
+
+local function dealerEspLocalPosition()
+    -- resolved per call: a stale localPlayer reference is the classic reason
+    -- the distance line silently never appears
+    local character = nil
+    local ok, player = pcall(function() return game:GetService('Players').LocalPlayer end)
+    if ok and player then character = player.Character end
+
+    if character then
+        local root = character:FindFirstChild('HumanoidRootPart')
+            or character:FindFirstChild('Torso')
+            or character:FindFirstChild('Head')
+        if root then return root.Position end
+    end
+
+    local camera = workspace.CurrentCamera
+    return camera and camera.CFrame.Position or nil
+end
+
+local function dealerEspUpdateText()
+    if next(dealerEsp.Tracked) == nil then return end
+
+    local origin = dealerEspLocalPosition()
+
+    for model, entry in pairs(dealerEsp.Tracked) do
+        if not model.Parent then
+            dealerEspDrop(model)
+        else
+            if not entry.Billboard then
+                dealerEspAttach(entry, model)
+            end
+
+            if entry.Billboard and entry.Label then
+                local text = entry.Name
+                if entry.kind == 'rebel' then
+                    text = library2:Translate('Rebel') .. ': ' .. entry.Name
+                elseif entry.kind == 'armory' then
+                    text = library2:Translate('Armory')
+                end
+                local visible = true
+
+                local anchor = entry.Anchor
+                if anchor and anchor.Parent and origin then
+                    local distance = (anchor.Position - origin).Magnitude
+                    if dealerEsp.MaxDistance > 0 and distance > dealerEsp.MaxDistance then
+                        visible = false
+                    end
+                    if dealerEsp.ShowDistance then
+                        text = string.format('%s [%dm]', text, math.floor(distance / 3 + 0.5))
+                    end
+                end
+
+                entry.Label.Text = text
+                entry.Billboard.Enabled = visible
+            end
+        end
+    end
+end
+
+dealerEsp.Signal = game:GetService('RunService').Heartbeat:Connect(function()
+    local now = os.clock()
+
+    if now >= dealerEsp.TextAt then
+        dealerEsp.TextAt = now + 0.15
+        pcall(dealerEspUpdateText)
+    end
+
+    if dealerEsp.Walking then
+        pcall(dealerEspStep)
+    end
+end)
+
+-- a rebel only exists after it spawns, so catch spawns instead of re-walking the map
+dealerEsp.Added = workspace.DescendantAdded:Connect(function(instance)
+    if not dealerEspIsOn() then return end
+    if not (instance:IsA('Model') or instance:IsA('BasePart')) then return end
+    if not dealerEspNameMatches(instance) then return end
+    pcall(dealerEspClassify, instance)
+end)
+
+local dealerEspToggle = dealerEspSection:AddToggle('DealerESPEnabled', {
+    Text = 'Dealer',
+    Default = false,
+    Tooltip = 'Draws name, distance and an outline over the plain dealer NPC.',
+    Callback = function(value)
+        dealerEsp.Enabled = value
+        if value then
+            dealerEspRescan()
+        else
+            dealerEspPrune('dealer')
+        end
+    end,
+})
+
+dealerEspToggle:AddColorPicker('DealerESPColor', {
+    Default = dealerEsp.Color,
+    Transparency = 0,
+    Title = 'Dealer color',
+    Callback = function(color)
+        dealerEsp.Color = color
+        for _, entry in pairs(dealerEsp.Tracked) do
+            if entry.kind == 'dealer' then dealerEspApplyStyle(entry) end
+        end
+    end,
+})
+
+local dealerEspArmoryToggle = dealerEspSection:AddToggle('DealerESPArmoryEnabled', {
+    Text = 'Armory Dealer',
+    Default = false,
+    Tooltip = 'Draws name, distance and an outline over the armory dealer NPC.',
+    Callback = function(value)
+        dealerEsp.ArmoryEnabled = value
+        if value then
+            dealerEspRescan()
+        else
+            dealerEspPrune('armory')
+        end
+    end,
+})
+
+dealerEspArmoryToggle:AddColorPicker('DealerESPArmoryColor', {
+    Default = dealerEsp.ArmoryColor,
+    Transparency = 0,
+    Title = 'Armory color',
+    Callback = function(color)
+        dealerEsp.ArmoryColor = color
+        for _, entry in pairs(dealerEsp.Tracked) do
+            if entry.kind == 'armory' then dealerEspApplyStyle(entry) end
+        end
+    end,
+})
+
+local dealerEspRebelToggle = dealerEspSection:AddToggle('DealerESPRebelEnabled', {
+    Text = 'Rebel Dealer',
+    Default = false,
+    Tooltip = 'Draws name, distance and an outline over the rebel dealer NPC.',
+    Callback = function(value)
+        dealerEsp.RebelEnabled = value
+        if value then
+            dealerEspRescan()
+        else
+            dealerEspPrune('rebel')
+        end
+    end,
+})
+
+dealerEspRebelToggle:AddColorPicker('DealerESPRebelColor', {
+    Default = dealerEsp.RebelColor,
+    Transparency = 0,
+    Title = 'Rebel color',
+    Callback = function(color)
+        dealerEsp.RebelColor = color
+        for _, entry in pairs(dealerEsp.Tracked) do
+            if entry.kind == 'rebel' then dealerEspApplyStyle(entry) end
+        end
+    end,
+})
+
+dealerEspSection:AddToggle('DealerESPShowDistance', {
+    Text = 'Show distance',
+    Default = true,
+    Tooltip = 'Appends the distance in meters next to the name.',
+    Callback = function(value)
+        dealerEsp.ShowDistance = value
+    end,
+})
+
+dealerEspSection:AddToggle('DealerESPHighlight', {
+    Text = 'Highlight',
+    Default = true,
+    Tooltip = 'Outlines the dealer model through walls.',
+    Callback = function(value)
+        dealerEsp.UseHighlight = value
+        for _, entry in pairs(dealerEsp.Tracked) do
+            dealerEspApplyStyle(entry)
+        end
+    end,
+})
+
+dealerEspSection:AddSlider('DealerESPMaxDistance', {
+    Text = 'Max distance',
+    Min = 0,
+    Max = 3000,
+    Default = 0,
+    Rounding = 0,
+    Suffix = ' m',
+    Tooltip = '0 draws every dealer on the map.',
+    Callback = function(value)
+        dealerEsp.MaxDistance = value
+    end,
+})
+
+library2:OnUnload(function()
+    if dealerEsp.Signal then
+        dealerEsp.Signal:Disconnect()
+        dealerEsp.Signal = nil
+    end
+    if dealerEsp.Added then
+        dealerEsp.Added:Disconnect()
+        dealerEsp.Added = nil
+    end
+    dealerEsp.Walking = false
+    dealerEsp.Queue = {}
+    dealerEspClear()
+end)
+end
+
+-- // crate esp — workspace.Filter.SpawnedPiles
+do
+local crateEspSection = viewPage:AddLeftGroupbox('Crate ESP')
+
+local crateEsp = {
+    RedEnabled = false,
+    GreenEnabled = false,
+    EventEnabled = false,
+    ShowDistance = true,
+    UseHighlight = true,
+    MaxDistance = 0,
+    RedColor = Color3.fromRGB(255, 80, 80),
+    GreenColor = Color3.fromRGB(90, 255, 120),
+    EventColor = Color3.fromRGB(255, 200, 40),
+    Tracked = {},
+    TextAt = 0,
+}
+
+-- piles respawn constantly, so the folder is resolved fresh every tick
+-- instead of cached; the walk itself is one GetChildren over a handful of models
+local crateEspRecursiveAt = 0
+
+local function crateEspFolder()
+    local filter = workspace:FindFirstChild('Filter')
+    if not filter then
+        -- recursive FindFirstChild is expensive, so it is rate limited
+        local now = os.clock()
+        if now < crateEspRecursiveAt then return nil end
+        crateEspRecursiveAt = now + 5
+        filter = workspace:FindFirstChild('Filter', true)
+    end
+    if not filter then return nil end
+    return filter:FindFirstChild('SpawnedPiles')
+end
+
+local function crateEspMesh(model)
+    local primary = model.PrimaryPart
+    if primary and primary:IsA('BasePart') then return primary end
+    local mesh = model:FindFirstChildWhichIsA('MeshPart', true)
+    if mesh then return mesh end
+    return model:FindFirstChildWhichIsA('BasePart', true)
+end
+
+local function crateEspIsOn()
+    return crateEsp.RedEnabled or crateEsp.GreenEnabled or crateEsp.EventEnabled
+end
+
+-- both crates share MeshId ...246 and the same grey Color (163,162,165),
+-- so the texture id is the only reliable discriminator:
+-- red = TextureID ...894, green = TextureID ...882
+local crateEspTextures = {
+    [11157915894] = 'red',
+    [11157911882] = 'green',
+}
+
+local function crateEspTextureKind(mesh)
+    if not mesh:IsA('MeshPart') then return nil end
+    local texture = tostring(mesh.TextureID)
+    local digits = string.match(texture, '(%d+)$')
+    if not digits then return nil end
+
+    local exact = crateEspTextures[tonumber(digits)]
+    if exact then return exact end
+
+    -- tolerance if the texture is ever re-uploaded with the same tail
+    local tail = string.sub(digits, -3)
+    if tail == '894' then return 'red' end
+    if tail == '882' then return 'green' end
+    return nil
+end
+
+local function crateEspKind(model)
+    if not model:IsA('Model') then return nil end
+    if model:GetAttribute('IsCrate') == false then return nil end
+
+    local mesh = crateEspMesh(model)
+    if not mesh then return nil end
+
+    local kind = crateEspTextureKind(mesh)
+    if kind then return kind, mesh end
+
+    -- kept as a safety net in case the texture ever changes
+    local brick = mesh.BrickColor.Name:lower()
+    if brick:find('green', 1, true) then return 'green', mesh end
+    if brick:find('red', 1, true) then return 'red', mesh end
+
+    local color = mesh.Color
+    if color.R > color.G + 0.12 then return 'red', mesh end
+    if color.G > color.R + 0.12 then return 'green', mesh end
+
+    -- unknown mesh in SpawnedPiles: airdrop / event pile
+    return 'event', mesh
+end
+
+local function crateEspWanted(kind)
+    if kind == 'red' then return crateEsp.RedEnabled end
+    if kind == 'event' then return crateEsp.EventEnabled end
+    return crateEsp.GreenEnabled
+end
+
+local function crateEspColorFor(entry)
+    if entry.kind == 'red' then return crateEsp.RedColor end
+    if entry.kind == 'event' then return crateEsp.EventColor end
+    return crateEsp.GreenColor
+end
+
+local crateEspLabels = {
+    red = 'Red Crate',
+    green = 'Green Crate',
+    event = 'airdrop // event',
+}
+
+local function crateEspLabel(kind)
+    return library2:Translate(crateEspLabels[kind] or 'Crate')
+end
+
+local function crateEspApplyStyle(entry)
+    local color = crateEspColorFor(entry)
+
+    if entry.Label then
+        entry.Label.TextColor3 = color
+    end
+
+    if entry.Highlight then
+        entry.Highlight.FillColor = color
+        entry.Highlight.OutlineColor = color
+        entry.Highlight.Enabled = crateEsp.UseHighlight
+    end
+end
+
+local function crateEspDrop(model)
+    local entry = crateEsp.Tracked[model]
+    if not entry then return end
+
+    crateEsp.Tracked[model] = nil
+
+    if entry.Billboard then
+        pcall(function() entry.Billboard:Destroy() end)
+    end
+    if entry.Highlight then
+        pcall(function() entry.Highlight:Destroy() end)
+    end
+end
+
+local function crateEspClear()
+    for model in pairs(crateEsp.Tracked) do
+        crateEspDrop(model)
+    end
+end
+
+local function crateEspPrune(kind)
+    for model, entry in pairs(crateEsp.Tracked) do
+        if entry.kind == kind then crateEspDrop(model) end
+    end
+end
+
+local function crateEspAttach(entry, mesh)
+    if not mesh or not mesh.Parent then return nil end
+
+    local billboard = Instance.new('BillboardGui')
+    billboard.Name = 'waneCrateESP'
+    billboard.AlwaysOnTop = true
+    billboard.Size = UDim2.fromOffset(200, 22)
+    billboard.StudsOffset = Vector3.new(0, 1.8, 0)
+    billboard.Adornee = mesh
+    billboard.Parent = mesh
+
+    local label = Instance.new('TextLabel')
+    label.Name = 'Label'
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.fromScale(1, 1)
+    label.Font = library2.Font or Enum.Font.Code
+    label.TextSize = 14
+    label.TextStrokeTransparency = 0
+    label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    label.Text = crateEspLabel(entry.kind)
+    label.Parent = billboard
+
+    entry.Billboard = billboard
+    entry.Label = label
+
+    local model = entry.Model
+    if model and model:IsA('Model') then
+        local highlight = Instance.new('Highlight')
+        highlight.Name = 'waneCrateESP'
+        highlight.Adornee = model
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.FillTransparency = 0.82
+        highlight.OutlineTransparency = 0
+        highlight.Parent = model
+        entry.Highlight = highlight
+    end
+
+    crateEspApplyStyle(entry)
+    return true
+end
+
+local function crateEspLocalPosition()
+    local character = nil
+    local ok, player = pcall(function() return game:GetService('Players').LocalPlayer end)
+    if ok and player then character = player.Character end
+
+    if character then
+        local root = character:FindFirstChild('HumanoidRootPart')
+            or character:FindFirstChild('Torso')
+            or character:FindFirstChild('Head')
+        if root then return root.Position end
+    end
+
+    local camera = workspace.CurrentCamera
+    return camera and camera.CFrame.Position or nil
+end
+
+local function crateEspScan()
+    for model in pairs(crateEsp.Tracked) do
+        if not model.Parent then crateEspDrop(model) end
+    end
+
+    if not crateEspIsOn() then return end
+
+    local folder = crateEspFolder()
+    if not folder then return end
+
+    for _, model in ipairs(folder:GetChildren()) do
+        if not crateEsp.Tracked[model] then
+            local kind, mesh = crateEspKind(model)
+            if kind and crateEspWanted(kind) then
+                local entry = { kind = kind, Name = model.Name, Model = model }
+                crateEsp.Tracked[model] = entry
+                -- no anchored mesh yet: forget it and let the next tick retry
+                if not crateEspAttach(entry, mesh) then
+                    crateEsp.Tracked[model] = nil
+                end
+            end
+        end
+    end
+end
+
+local function crateEspUpdateText()
+    if next(crateEsp.Tracked) == nil then return end
+
+    local origin = crateEspLocalPosition()
+
+    for model, entry in pairs(crateEsp.Tracked) do
+        if not model.Parent then
+            crateEspDrop(model)
+        else
+            local billboard = entry.Billboard
+            if not billboard or not billboard.Parent then
+                crateEspDrop(model)
+            else
+                local anchor = billboard.Adornee
+                local text = crateEspLabel(entry.kind)
+                local visible = true
+
+                if anchor and anchor.Parent and origin then
+                    local distance = (anchor.Position - origin).Magnitude
+                    if crateEsp.MaxDistance > 0 and distance > crateEsp.MaxDistance then
+                        visible = false
+                    end
+                    if crateEsp.ShowDistance then
+                        text = string.format('%s [%dm]', text, math.floor(distance / 3 + 0.5))
+                    end
+                end
+
+                entry.Label.Text = text
+                billboard.Enabled = visible
+            end
+        end
+    end
+end
+
+crateEsp.Signal = game:GetService('RunService').Heartbeat:Connect(function()
+    local now = os.clock()
+    if now < crateEsp.TextAt then return end
+    crateEsp.TextAt = now + 0.2
+
+    pcall(crateEspUpdateText)
+    pcall(crateEspScan)
+end)
+
+local crateEspRedToggle = crateEspSection:AddToggle('CrateESPRedEnabled', {
+    Text = 'Red Crate',
+    Default = false,
+    Tooltip = 'Draws name, distance and an outline over the red crates.',
+    Callback = function(value)
+        crateEsp.RedEnabled = value
+        if value then
+            crateEspScan()
+        else
+            crateEspPrune('red')
+        end
+    end,
+})
+
+crateEspRedToggle:AddColorPicker('CrateESPRedColor', {
+    Default = crateEsp.RedColor,
+    Transparency = 0,
+    Title = 'Red crate color',
+    Callback = function(color)
+        crateEsp.RedColor = color
+        for _, entry in pairs(crateEsp.Tracked) do
+            if entry.kind == 'red' then crateEspApplyStyle(entry) end
+        end
+    end,
+})
+
+local crateEspGreenToggle = crateEspSection:AddToggle('CrateESPGreenEnabled', {
+    Text = 'Green Crate',
+    Default = false,
+    Tooltip = 'Draws name, distance and an outline over the green crates.',
+    Callback = function(value)
+        crateEsp.GreenEnabled = value
+        if value then
+            crateEspScan()
+        else
+            crateEspPrune('green')
+        end
+    end,
+})
+
+crateEspGreenToggle:AddColorPicker('CrateESPGreenColor', {
+    Default = crateEsp.GreenColor,
+    Transparency = 0,
+    Title = 'Green crate color',
+    Callback = function(color)
+        crateEsp.GreenColor = color
+        for _, entry in pairs(crateEsp.Tracked) do
+            if entry.kind == 'green' then crateEspApplyStyle(entry) end
+        end
+    end,
+})
+
+local crateEspEventToggle = crateEspSection:AddToggle('CrateESPEventEnabled', {
+    Text = 'Event / Airdrop',
+    Default = false,
+    Tooltip = 'Draws any other pile in SpawnedPiles as airdrop // event.',
+    Callback = function(value)
+        crateEsp.EventEnabled = value
+        if value then
+            crateEspScan()
+        else
+            crateEspPrune('event')
+        end
+    end,
+})
+
+crateEspEventToggle:AddColorPicker('CrateESPEventColor', {
+    Default = crateEsp.EventColor,
+    Transparency = 0,
+    Title = 'Event color',
+    Callback = function(color)
+        crateEsp.EventColor = color
+        for _, entry in pairs(crateEsp.Tracked) do
+            if entry.kind == 'event' then crateEspApplyStyle(entry) end
+        end
+    end,
+})
+
+crateEspSection:AddToggle('CrateESPShowDistance', {
+    Text = 'Show distance',
+    Default = true,
+    Tooltip = 'Appends the distance in meters next to the name.',
+    Callback = function(value)
+        crateEsp.ShowDistance = value
+    end,
+})
+
+crateEspSection:AddToggle('CrateESPHighlight', {
+    Text = 'Highlight',
+    Default = true,
+    Tooltip = 'Outlines the crate through walls.',
+    Callback = function(value)
+        crateEsp.UseHighlight = value
+        for _, entry in pairs(crateEsp.Tracked) do
+            crateEspApplyStyle(entry)
+        end
+    end,
+})
+
+crateEspSection:AddSlider('CrateESPMaxDistance', {
+    Text = 'Max distance',
+    Min = 0,
+    Max = 3000,
+    Default = 0,
+    Rounding = 0,
+    Suffix = ' m',
+    Tooltip = '0 draws every crate on the map.',
+    Callback = function(value)
+        crateEsp.MaxDistance = value
+    end,
+})
+
+library2:OnUnload(function()
+    if crateEsp.Signal then
+        crateEsp.Signal:Disconnect()
+        crateEsp.Signal = nil
+    end
+    crateEspClear()
+end)
+end
 
 local sensoryFonts = {
     'Proggy Clean',
